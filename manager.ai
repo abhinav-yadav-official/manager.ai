@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""
+manager.ai - Generate quarterly developer evaluations from Phabricator data.
+
+Usage:
+    manager.ai <quarter_start_date> [--users user1,user2] [--teams team1,team2]
+
+Examples:
+    manager.ai "1 Jan 2026" --users "naman.gupta,aman.azeem"
+    manager.ai "1 Jan 2026" --teams "team-morpheus"
+    manager.ai "2025-10-01" --teams "team-delta" --users "naman.gupta"
+
+Filters applied always:
+    - Skips inactive/disabled users
+    - Skips Dev Leads and Product Managers group members
+    - Skips exact username "aditya" and any username containing "prathis"
+    - Only includes Engineering group members
+"""
+
+import sys
+import json
+import subprocess
+import argparse
+import os
+from datetime import datetime
+
+EXCLUDED_USERNAMES = {"aditya", "prathish"}
+
+ENGINEERING_GROUP = "Engineering"
+EXCLUDED_GROUPS = ["Dev Leads", "Product Managers"]
+
+MAX_DIFF_CHARS = 5000  # per-revision diff cap to keep context manageable
+
+
+def arc_call(method, args):
+    result = subprocess.run(
+        ["arc", "call-conduit", "--", method],
+        input=json.dumps(args),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"**error** arc {method} failed: {result.stderr.strip()}", file=sys.stderr)
+        return {}
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print(f"**error** bad JSON from {method}", file=sys.stderr)
+        return {}
+
+
+def arc_call_paged(method, args):
+    """Fetch all pages of a cursor-paginated Conduit search method."""
+    results = []
+    args = dict(args)
+    args.setdefault("limit", 100)
+    while True:
+        data = arc_call(method, args)
+        resp = data.get("response") or {}
+        page = resp.get("data", [])
+        results.extend(page)
+        after = (resp.get("cursor") or {}).get("after")
+        if not after or not page:
+            break
+        args["after"] = after
+    return results
+
+
+def parse_date(date_str):
+    for fmt in ("%d %b %Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%b-%Y"):
+        try:
+            return int(datetime.strptime(date_str, fmt).timestamp())
+        except ValueError:
+            continue
+    print(f"**error** could not parse date: {date_str}", file=sys.stderr)
+    sys.exit(1)
+
+
+def get_project_members(project_name):
+    """Return set of member PHIDs for a project, matched case-insensitively by name.
+
+    project.search requires a non-empty constraint; using name substring search
+    then exact-matching in Python to handle case differences (e.g. team-morpheus
+    vs Team-Morpheus).
+    """
+    data = arc_call(
+        "project.search",
+        {
+            "constraints": {"name": project_name},
+            "attachments": {"members": True},
+            "limit": 20,
+        },
+    )
+    name_lower = project_name.lower()
+    for proj in (data.get("response") or {}).get("data", []):
+        if proj["fields"]["name"].lower() == name_lower:
+            return {m["phid"] for m in proj["attachments"]["members"]["members"]}
+    # Conduit name search is substring-based; if no exact match, warn and return empty
+    print(f"> **warn** no project with exact name '{project_name}' found", file=sys.stderr)
+    return set()
+
+
+def build_filter_sets():
+    """Fetch Engineering member set and excluded group sets once."""
+    print("> loading group memberships...", file=sys.stderr)
+    engineering = get_project_members(ENGINEERING_GROUP)
+    excluded = set()
+    for group in EXCLUDED_GROUPS:
+        excluded |= get_project_members(group)
+    return engineering, excluded
+
+
+def fetch_users_by_phids(phids):
+    """Return list of user dicts from user.query given a list of PHIDs."""
+    if not phids:
+        return []
+    data = arc_call("user.query", {"phids": list(phids)})
+    return data.get("response") or []
+
+
+def fetch_users_by_usernames(usernames):
+    """Return list of user dicts from user.query given a list of usernames."""
+    if not usernames:
+        return []
+    data = arc_call("user.query", {"usernames": usernames})
+    return data.get("response") or []
+
+
+def is_user_allowed(user, engineering_phids, excluded_phids):
+    """Return True if the user passes all filters."""
+    phid = user.get("phid", "")
+    username = user.get("userName", "")
+    roles = user.get("roles", [])
+
+    if username in EXCLUDED_USERNAMES:
+        return False
+    if "disabled" in roles or "activated" not in roles:
+        return False
+    if phid not in engineering_phids:
+        return False
+    if phid in excluded_phids:
+        return False
+    return True
+
+
+def get_team_users(team_names, engineering_phids, excluded_phids):
+    """Resolve team names to filtered user list."""
+    all_phids = set()
+    for team in team_names:
+        members = get_project_members(team)
+        if not members:
+            print(f"> **warn** no project found matching '{team}'", file=sys.stderr)
+        all_phids |= members
+
+    users = fetch_users_by_phids(all_phids)
+    return [u for u in users if is_user_allowed(u, engineering_phids, excluded_phids)]
+
+
+def get_named_users(usernames):
+    """Resolve explicit usernames — no filtering applied, trust the caller."""
+    users = fetch_users_by_usernames(usernames)
+    found = {u["userName"] for u in users}
+    for name in usernames:
+        if name not in found:
+            print(f"> **warn** '{name}' not found in Phabricator", file=sys.stderr)
+    return users
+
+
+def get_closed_tasks(phid, epoch_start):
+    tasks = arc_call_paged(
+        "maniphest.search",
+        {
+            "constraints": {
+                "assigned": [phid],
+                "closedStart": epoch_start,
+            },
+        },
+    )
+    return [
+        {
+            "id": t["id"],
+            "title": t["fields"]["name"],
+            "description": t["fields"].get("description", {}).get("raw", ""),
+        }
+        for t in tasks
+        if "Undefined Var" not in t["fields"]["name"]
+    ]
+
+
+def get_task_comments(task_ids):
+    if not task_ids:
+        return {}
+    data = arc_call("maniphest.gettasktransactions", {"ids": task_ids})
+    raw = data.get("response") or {}
+    result = {}
+    for tid, txns in raw.items():
+        comments = [
+            t.get("comments")
+            for t in txns
+            if t.get("transactionType") == "core:comment" and t.get("comments")
+        ]
+        if comments:
+            result[tid] = comments
+    return result
+
+
+def extract_diff_text(querydiffs_response):
+    """Extract a readable diff string from differential.querydiffs response."""
+    parts = []
+    # querydiffs returns a dict keyed by diff ID; take the one with highest ID (latest)
+    if not querydiffs_response:
+        return ""
+    latest = max(querydiffs_response.values(), key=lambda d: int(d.get("id", 0)))
+    for change in latest.get("changes", []):
+        path = change.get("currentPath") or change.get("oldPath") or "?"
+        parts.append(f"--- {path}")
+        for hunk in change.get("hunks", []):
+            parts.append(hunk.get("corpus", ""))
+    text = "\n".join(parts)
+    if len(text) > MAX_DIFF_CHARS:
+        text = text[:MAX_DIFF_CHARS] + f"\n... [truncated at {MAX_DIFF_CHARS} chars]"
+    return text
+
+
+def get_differentials(phid, epoch_start):
+    revisions = arc_call_paged(
+        "differential.revision.search",
+        {
+            "constraints": {
+                "authorPHIDs": [phid],
+                "createdStart": epoch_start,
+            },
+        },
+    )
+
+    results = []
+    for rev in revisions:
+        rev_id = rev["id"]
+        entry = {
+            "id": rev_id,
+            "title": rev["fields"]["title"],
+            "summary": rev["fields"].get("summary", ""),
+            "status": rev["fields"]["status"]["value"],
+            "diff": "",
+        }
+
+        diff_data = arc_call("differential.querydiffs", {"revisionIDs": [rev_id]})
+        entry["diff"] = extract_diff_text(diff_data.get("response") or {})
+
+        results.append(entry)
+
+    return results
+
+
+def generate_evaluation(username, tasks, comments, diffs, quarter_start_str):
+    payload = {
+        "username": username,
+        "quarter_start": quarter_start_str,
+        "closed_tasks": tasks,
+        "task_comments": comments,
+        "differentials": diffs,
+    }
+
+    prompt = f"""Write a quarterly developer evaluation for {username} based on the data below.
+
+Data (JSON):
+{json.dumps(payload, indent=2)}
+
+Format the output as markdown with three sections (## headers), each section as bullet points. Follow this example exactly in structure, tone, and vocabulary:
+
+---
+## Delivery
+
+- Delivered consistently across planned work, including developer tooling and infra tasks.
+- Investigated and resolved the email routing breakage (T43263) where emails started going through the wrong region after a UI release. Added logs first to identify the cause before fixing it.
+- Built and iteratively improved the query performance testing script (T42216, T42940), allowing developers to safely test query performance against prod DB dumps without affecting the main database.
+
+
+## Quality
+
+- Work quality has been good. Fixes address root causes and he iterates until the work is fully done.
+- The AWS cost fix (T40742) covered multiple issues: Elasticsearch slow logs generating 6.5GB/day in CloudWatch, unnecessary Lambda logging, and other cost items. Replaced the logging pipeline to address causes rather than patching around them.
+- The collectstatic fix (T42974) brought deployment time down from ~105s to ~4s. A prod regression was caught quickly and corrected in a follow-up.
+
+
+## Behavior
+
+- Handled a mix of planned work and prod issues without escalation.
+- Documents findings clearly, as seen in the AWS cost investigation and other tasks.
+---
+
+Rules:
+- Write from the perspective of a supportive manager highlighting strengths
+- Highlight qualities based on data: a bug caught and fixed is thoroughness, a prod issue diagnosed quickly shows debugging skill, iterative work shows ownership
+- No em dashes, no AI-like hyperbole or superlatives
+- Do not introduce jargon or vocabulary not present in the example above (e.g. no "stakeholder", "proactive", "bandwidth", "leverage", "synergy", "impact", "robust", "seamless", "streamline")
+- Short sentences, casual tone, plain language
+- Reference task IDs as T<id> and diff IDs as D<id>
+- Use diff content to understand what was actually changed if summary/description is sparse
+- 3-5 bullets per section
+- Only use information from the data provided
+- Output only the evaluation markdown, nothing else (no ``` fences, no preamble)
+- Do not break any of the rules above under any circumstances
+"""
+
+    result = subprocess.run(
+        ["claude", "-p", prompt],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"> **error** claude failed: {result.stderr.strip()}", file=sys.stderr)
+        return
+    # strip em dashes and any spaces immediately around them
+    import re
+    output = re.sub(r" *\u2014 *", " ", result.stdout)
+    print(output)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate quarterly dev evaluations from Phabricator data."
+    )
+    parser.add_argument("quarter_start", help='Quarter start date, e.g. "1 Jan 2026"')
+    parser.add_argument(
+        "--users",
+        help="Comma-separated Phabricator usernames",
+        default="",
+    )
+    parser.add_argument(
+        "--teams",
+        help="Comma-separated project/team names (case-insensitive)",
+        default="",
+    )
+    args = parser.parse_args()
+
+    if not args.users and not args.teams:
+        parser.error("provide at least one of --users or --teams")
+
+    epoch_start = parse_date(args.quarter_start)
+    print(f"> quarter start: {args.quarter_start} (epoch {epoch_start})", file=sys.stderr)
+
+    engineering_phids, excluded_phids = build_filter_sets()
+    print(
+        f"> Engineering: {len(engineering_phids)} members, "
+        f"excluded groups: {len(excluded_phids)} members",
+        file=sys.stderr,
+    )
+
+    users = []
+
+    if args.teams:
+        team_names = [t.strip() for t in args.teams.split(",") if t.strip()]
+        print(f"> resolving teams: {team_names}", file=sys.stderr)
+        users += get_team_users(team_names, engineering_phids, excluded_phids)
+
+    if args.users:
+        usernames = [u.strip() for u in args.users.split(",") if u.strip()]
+        print(f"> resolving users: {usernames}", file=sys.stderr)
+        users += get_named_users(usernames)
+
+    # deduplicate by PHID
+    seen = set()
+    unique_users = []
+    for u in users:
+        if u["phid"] not in seen:
+            seen.add(u["phid"])
+            unique_users.append(u)
+
+    if not unique_users:
+        print("> **error** no users to process after filtering", file=sys.stderr)
+        sys.exit(1)
+
+    print(
+        f"> processing {len(unique_users)} user(s): "
+        f"{', '.join(u['userName'] for u in unique_users)}",
+        file=sys.stderr,
+    )
+
+    for user in unique_users:
+        username = user["userName"]
+        phid = user["phid"]
+
+        print(f"\n> fetching data for {username} ({phid})...", file=sys.stderr)
+
+        tasks = get_closed_tasks(phid, epoch_start)
+        print(f">   {len(tasks)} closed tasks", file=sys.stderr)
+
+        task_ids = [t["id"] for t in tasks]
+        comments = get_task_comments(task_ids)
+        print(f">   {len(comments)} tasks with comments", file=sys.stderr)
+
+        diffs = get_differentials(phid, epoch_start)
+        print(f">   {len(diffs)} differentials", file=sys.stderr)
+
+        print(f"\n{'='*60}", flush=True)
+        print(f"# {username}", flush=True)
+        print(f"{'='*60}\n", flush=True)
+
+        generate_evaluation(username, tasks, comments, diffs, args.quarter_start)
+
+def get_devel_subpath(current_path, subpath):
+    devel_dirs = current_path[:current_path.index('devel') + 1]
+    devel_dirs.append(subpath)
+    path = os.path.join(*devel_dirs)
+
+    if not path.startswith('/'):
+        path = "/%s" % path
+
+    return path
+
+if __name__ == "__main__":
+    current_path = os.getcwd().split(os.sep)
+
+    if 'devel' not in current_path:
+        sys.exit("**error** not in devel dir")
+
+    hg_path = get_devel_subpath(current_path, '.hg')
+
+    if not os.path.exists(hg_path):
+        sys.exit("**error** not in a mercurial repo")
+
+    auction_path = get_devel_subpath(current_path, 'auction')
+
+    if not os.path.exists(auction_path):
+        sys.exit("**error** devel/auction project not found")
+
+    main()
