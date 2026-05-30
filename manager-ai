@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-manager.ai - Generate quarterly developer evaluations from Phabricator data.
+ManagerAI - Generate quarterly developer evaluations from Phabricator data.
 
 Usage:
-    manager.ai <quarter_start_date> [--users user1,user2] [--teams team1,team2]
+    manager-ai <quarter_start_date> [--users user1,user2] [--teams team1,team2]
 
 Examples:
-    manager.ai "1 Jan 2026" --users "naman.gupta,aman.azeem"
-    manager.ai "1 Jan 2026" --teams "team-morpheus"
-    manager.ai "2025-10-01" --teams "team-delta" --users "naman.gupta"
+    manager-ai "1 Jan 2026" --users "naman.gupta,aman.azeem"
+    manager-ai "1 Jan 2026" --teams "team-morpheus"
+    manager-ai "2025-10-01" --teams "team-delta" --users "naman.gupta"
 
 Filters applied always:
     - Skips inactive/disabled users
