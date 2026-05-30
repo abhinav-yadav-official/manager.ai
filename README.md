@@ -1,50 +1,43 @@
+<div align="center">
+
 # manager.ai
 
-Generate quarterly developer evaluations from Phabricator data.
+**Generate quarterly developer evaluations from Phabricator activity.**
 
-`manager.ai` fetches closed tasks, task comments, and Differential revisions for selected users, then sends that data to Claude with a strict writing prompt to produce concise manager-style quarterly feedback.
+[![Release](https://img.shields.io/github/v/release/abhinav-yadav-official/manager.ai?style=for-the-badge)](https://github.com/abhinav-yadav-official/manager.ai/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.x-3776AB?style=for-the-badge&logo=python&logoColor=white)]()
 
-## What it does
+</div>
 
-- Accepts a quarter start date
-- Selects users via:
-  - `--users` (explicit usernames), and/or
-  - `--teams` (Phabricator project/team names)
-- Applies filters for team-based selection:
-  - skips inactive/disabled users
-  - skips members of `Dev Leads` and `Product Managers`
-  - skips exact username `aditya` and usernames containing `prathis`
-  - only includes members of `Engineering`
-- Fetches:
-  - closed Maniphest tasks since quarter start
-  - task comments for those tasks
-  - Differential revisions since quarter start
-  - latest diff content per revision (truncated for context size)
-- Generates markdown evaluations with sections:
-  - `## Delivery`
-  - `## Quality`
-  - `## Behavior`
+## Overview
 
-## Requirements
+manager.ai pulls a quarter's worth of Phabricator activity — closed tasks, task comments, and Differential revisions — for selected engineers, then uses a language model to write concise, manager-style quarterly feedback. The model summarisation is the core of the tool: it turns raw activity into structured `Delivery` and `Quality` write-ups.
 
-You need these tools available in your shell:
+## Features
 
-- `python3`
-- `arc` (Arcanist), authenticated for Conduit calls
-- `claude` CLI, authenticated
+- **Flexible selection** — pick engineers by `--users` and/or `--teams` (Phabricator projects).
+- **Team filters** — skip inactive/disabled accounts, Dev Leads, Product Managers; include only Engineering members.
+- **Activity fetch** — closed Maniphest tasks, their comments, and Differential revisions (with truncated diffs) since the quarter start.
+- **Model-generated evaluations** — markdown per engineer with `## Delivery` and `## Quality` sections, produced under a strict writing prompt.
 
-You also need to run this script from inside a Mercurial repo under a `devel` directory. The script validates:
+## Installation
 
-- current path includes `devel`
-- `devel/.hg` exists
-- `devel/auction` exists
+Prereqs: Python 3.x, Phabricator Conduit access, a model API key.
+
+```sh
+git clone https://github.com/abhinav-yadav-official/manager.ai.git
+cd manager.ai
+# configure Conduit token + model API key (see manager.ai/)
+```
 
 ## Usage
 
-```/dev/null/usage.txt#L1-4
-manager.ai <quarter_start_date> [--users user1,user2] [--teams team1,team2]
+```sh
+./manager.ai --quarter-start 2026-01-01 --teams Engineering
+./manager.ai --quarter-start 2026-01-01 --users alice bob
+```
 
-manager.ai "1 Jan 2026" --users "naman.gupta,aman.azeem"
-manager.ai "1 Jan 2026" --teams "team-morpheus"
-manager.ai "2025-10-01" --teams "team-delta" --users "naman.gupta"
+## License
 
+[MIT](LICENSE) © 2026 Abhinav Yadav
