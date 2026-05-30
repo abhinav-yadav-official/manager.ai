@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""
+DevFeedbackAI - Generate developer feedback from engineering activity.
+
+Examples:
+    dev-feedback-ai "2026-01-01" --provider git --users "alice,bob"
+    dev-feedback-ai "2026-01-01" --provider git --repo /path/to/repo --users "Alice <alice@example.com>"
+    dev-feedback-ai "2026-01-01" --provider phabricator --teams "team-delta"
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+
+APP_NAME = "DevFeedbackAI"
+ENGINEERING_GROUP = "Engineering"
+EXCLUDED_GROUPS = ["Dev Leads", "Product Managers"]
+EXCLUDED_USERNAMES = {"aditya", "prathish"}
+MAX_DIFF_CHARS = 5000
+MAX_COMMIT_BODY_CHARS = 3000
+
+
+def load_dotenv(path=".env"):
+    if not os.path.exists(path):
+        return
+    with open(path) as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key, value)
+
+
+def run_command(command, input_text=None, cwd=None):
+    result = subprocess.run(
+        command,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    return result
+
+
+def parse_csv(value):
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_date(date_str):
+    for fmt in ("%d %b %Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%b-%Y"):
+        try:
+            dt = datetime.strptime(date_str, fmt).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp()), dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    print(f"**error** could not parse date: {date_str}", file=sys.stderr)
+    sys.exit(1)
+
+
+def truncate(text, max_chars):
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n... [truncated at {max_chars} chars]"
+
+
+def arc_call(method, args):
+    result = run_command(
+        ["arc", "call-conduit", "--", method],
+        input_text=json.dumps(args),
+    )
+    if result.returncode != 0:
+        print(f"**error** arc {method} failed: {result.stderr.strip()}", file=sys.stderr)
+        return {}
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print(f"**error** bad JSON from {method}", file=sys.stderr)
+        return {}
+
+
+def arc_call_paged(method, args):
+    results = []
+    args = dict(args)
+    args.setdefault("limit", 100)
+    while True:
+        data = arc_call(method, args)
+        resp = data.get("response") or {}
+        page = resp.get("data", [])
+        results.extend(page)
+        after = (resp.get("cursor") or {}).get("after")
+        if not after or not page:
+            break
+        args["after"] = after
+    return results
+
+
+def get_project_members(project_name):
+    data = arc_call(
+        "project.search",
+        {
+            "constraints": {"name": project_name},
+            "attachments": {"members": True},
+            "limit": 20,
+        },
+    )
+    name_lower = project_name.lower()
+    for proj in (data.get("response") or {}).get("data", []):
+        if proj["fields"]["name"].lower() == name_lower:
+            return {m["phid"] for m in proj["attachments"]["members"]["members"]}
+    print(f"> **warn** no project with exact name '{project_name}' found", file=sys.stderr)
+    return set()
+
+
+def fetch_users_by_phids(phids):
+    if not phids:
+        return []
+    data = arc_call("user.query", {"phids": list(phids)})
+    return data.get("response") or []
+
+
+def fetch_users_by_usernames(usernames):
+    if not usernames:
+        return []
+    data = arc_call("user.query", {"usernames": usernames})
+    return data.get("response") or []
+
+
+def is_user_allowed(user, engineering_phids, excluded_phids):
+    phid = user.get("phid", "")
+    username = user.get("userName", "")
+    roles = user.get("roles", [])
+    if username in EXCLUDED_USERNAMES:
+        return False
+    if "disabled" in roles or "activated" not in roles:
+        return False
+    if phid not in engineering_phids:
+        return False
+    if phid in excluded_phids:
+        return False
+    return True
+
+
+def build_filter_sets():
+    print("> loading group memberships...", file=sys.stderr)
+    engineering = get_project_members(ENGINEERING_GROUP)
+    excluded = set()
+    for group in EXCLUDED_GROUPS:
+        excluded |= get_project_members(group)
+    return engineering, excluded
+
+
+def get_team_users(team_names, engineering_phids, excluded_phids):
+    all_phids = set()
+    for team in team_names:
+        members = get_project_members(team)
+        if not members:
+            print(f"> **warn** no project found matching '{team}'", file=sys.stderr)
+        all_phids |= members
+    users = fetch_users_by_phids(all_phids)
+    return [u for u in users if is_user_allowed(u, engineering_phids, excluded_phids)]
+
+
+def get_closed_tasks(phid, epoch_start):
+    tasks = arc_call_paged(
+        "maniphest.search",
+        {
+            "constraints": {
+                "assigned": [phid],
+                "closedStart": epoch_start,
+            },
+        },
+    )
+    return [
+        {
+            "kind": "task",
+            "id": f"T{task['id']}",
+            "title": task["fields"]["name"],
+            "description": task["fields"].get("description", {}).get("raw", ""),
+        }
+        for task in tasks
+        if "Undefined Var" not in task["fields"]["name"]
+    ]
+
+
+def get_task_comments(task_ids):
+    if not task_ids:
+        return {}
+    data = arc_call("maniphest.gettasktransactions", {"ids": task_ids})
+    raw = data.get("response") or {}
+    result = {}
+    for task_id, txns in raw.items():
+        comments = [
+            txn.get("comments")
+            for txn in txns
+            if txn.get("transactionType") == "core:comment" and txn.get("comments")
+        ]
+        if comments:
+            result[f"T{task_id}"] = comments
+    return result
+
+
+def extract_diff_text(querydiffs_response):
+    if not querydiffs_response:
+        return ""
+    latest = max(querydiffs_response.values(), key=lambda d: int(d.get("id", 0)))
+    parts = []
+    for change in latest.get("changes", []):
+        path = change.get("currentPath") or change.get("oldPath") or "?"
+        parts.append(f"--- {path}")
+        for hunk in change.get("hunks", []):
+            parts.append(hunk.get("corpus", ""))
+    return truncate("\n".join(parts), MAX_DIFF_CHARS)
+
+
+def get_differentials(phid, epoch_start):
+    revisions = arc_call_paged(
+        "differential.revision.search",
+        {
+            "constraints": {
+                "authorPHIDs": [phid],
+                "createdStart": epoch_start,
+            },
+        },
+    )
+    results = []
+    for rev in revisions:
+        rev_id = rev["id"]
+        diff_data = arc_call("differential.querydiffs", {"revisionIDs": [rev_id]})
+        results.append(
+            {
+                "kind": "revision",
+                "id": f"D{rev_id}",
+                "title": rev["fields"]["title"],
+                "summary": rev["fields"].get("summary", ""),
+                "status": rev["fields"]["status"]["value"],
+                "diff": extract_diff_text(diff_data.get("response") or {}),
+            }
+        )
+    return results
+
+
+def collect_phabricator_activity(args, epoch_start):
+    engineering_phids, excluded_phids = build_filter_sets()
+    users = []
+
+    if args.teams:
+        team_names = parse_csv(args.teams)
+        print(f"> resolving teams: {team_names}", file=sys.stderr)
+        users += get_team_users(team_names, engineering_phids, excluded_phids)
+
+    if args.users:
+        usernames = parse_csv(args.users)
+        print(f"> resolving users: {usernames}", file=sys.stderr)
+        users += fetch_users_by_usernames(usernames)
+
+    unique_users = []
+    seen = set()
+    for user in users:
+        if user["phid"] in seen:
+            continue
+        seen.add(user["phid"])
+        unique_users.append(user)
+
+    if not unique_users:
+        print("> **error** no users to process after filtering", file=sys.stderr)
+        sys.exit(1)
+
+    datasets = []
+    for user in unique_users:
+        username = user["userName"]
+        phid = user["phid"]
+        print(f"> fetching Phabricator data for {username} ({phid})...", file=sys.stderr)
+        tasks = get_closed_tasks(phid, epoch_start)
+        comments = get_task_comments([int(task["id"][1:]) for task in tasks])
+        revisions = get_differentials(phid, epoch_start)
+        datasets.append(
+            {
+                "person": username,
+                "provider": "phabricator",
+                "activities": tasks + revisions,
+                "comments": comments,
+            }
+        )
+    return datasets
+
+
+def git(args, *git_args):
+    return run_command(["git", *git_args], cwd=args.repo)
+
+
+def git_authors(args, since_iso):
+    result = git(
+        args,
+        "log",
+        f"--since={since_iso}",
+        "--format=%aN <%aE>",
+    )
+    if result.returncode != 0:
+        print(f"**error** git log failed: {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    return sorted(set(line.strip() for line in result.stdout.splitlines() if line.strip()))
+
+
+def git_commit_activity(args, author, since_iso):
+    separator = "\x1f"
+    result = git(
+        args,
+        "log",
+        f"--since={since_iso}",
+        f"--author={author}",
+        f"--format=%H{separator}%h{separator}%ad{separator}%s{separator}%b",
+        "--date=short",
+        "--numstat",
+    )
+    if result.returncode != 0:
+        print(f"**error** git log failed for {author}: {result.stderr.strip()}", file=sys.stderr)
+        return []
+
+    commits = []
+    current = None
+    for line in result.stdout.splitlines():
+        if separator in line:
+            if current:
+                commits.append(current)
+            full_hash, short_hash, date, subject, body = line.split(separator, 4)
+            current = {
+                "kind": "commit",
+                "id": short_hash,
+                "hash": full_hash,
+                "date": date,
+                "title": subject,
+                "body": truncate(body.strip(), MAX_COMMIT_BODY_CHARS),
+                "files": [],
+            }
+            continue
+        if current and line.strip():
+            parts = line.split("\t")
+            if len(parts) == 3:
+                current["files"].append(
+                    {
+                        "added": parts[0],
+                        "deleted": parts[1],
+                        "path": parts[2],
+                    }
+                )
+    if current:
+        commits.append(current)
+    return commits
+
+
+def collect_git_activity(args, _epoch_start, since_iso):
+    if args.teams:
+        print("> **warn** --teams is ignored by the git provider", file=sys.stderr)
+
+    users = parse_csv(args.users) if args.users else git_authors(args, since_iso)
+    if not users:
+        print("> **error** no git authors found", file=sys.stderr)
+        sys.exit(1)
+
+    datasets = []
+    for user in users:
+        print(f"> fetching git commits for {user}...", file=sys.stderr)
+        datasets.append(
+            {
+                "person": user,
+                "provider": "git",
+                "repo": os.path.abspath(args.repo),
+                "activities": git_commit_activity(args, user, since_iso),
+                "comments": {},
+            }
+        )
+    return datasets
+
+
+def build_prompt(dataset, quarter_start):
+    payload = {
+        "person": dataset["person"],
+        "provider": dataset["provider"],
+        "quarter_start": quarter_start,
+        "repo": dataset.get("repo"),
+        "activities": dataset["activities"],
+        "comments": dataset.get("comments", {}),
+    }
+    return f"""Write quarterly developer feedback for {dataset["person"]} based on the data below.
+
+Data (JSON):
+{json.dumps(payload, indent=2)}
+
+Format the output as markdown with three sections (## headers), each section as bullet points. Follow this example in structure, tone, and vocabulary:
+
+---
+## Delivery
+
+- Delivered consistently across planned work, including developer tooling and infra tasks.
+- Investigated and resolved the email routing breakage (T43263) where emails started going through the wrong region after a UI release. Added logs first to identify the cause before fixing it.
+- Built and iteratively improved the query performance testing script (T42216, T42940), allowing developers to safely test query performance against prod DB dumps without affecting the main database.
+
+## Quality
+
+- Work quality has been good. Fixes address root causes and he iterates until the work is fully done.
+- The AWS cost fix (T40742) covered multiple issues: Elasticsearch slow logs generating 6.5GB/day in CloudWatch, unnecessary Lambda logging, and other cost items. Replaced the logging pipeline to address causes rather than patching around them.
+- The collectstatic fix (T42974) brought deployment time down from about 105s to about 4s. A prod regression was caught quickly and corrected in a follow-up.
+
+## Behavior
+
+- Handled a mix of planned work and prod issues without escalation.
+- Documents findings clearly, as seen in the AWS cost investigation and other tasks.
+---
+
+Rules:
+- Write from the perspective of a supportive manager highlighting strengths.
+- Highlight qualities based on data: a bug caught and fixed is thoroughness, a prod issue diagnosed quickly shows debugging skill, iterative work shows ownership.
+- No em dashes, no AI-like hyperbole or superlatives.
+- Short sentences, casual tone, plain language.
+- Reference source IDs when useful, such as T123, D123, or commit hashes.
+- Use file and diff summaries to understand what changed when descriptions are sparse.
+- 3-5 bullets per section.
+- Only use information from the data provided.
+- Output only the feedback markdown, nothing else.
+- Do not break any of the rules above under any circumstances.
+"""
+
+
+def generate_feedback(dataset, quarter_start):
+    model_command = shlex.split(os.environ.get("DEVFEEDBACKAI_MODEL_COMMAND", "claude -p"))
+    prompt = build_prompt(dataset, quarter_start)
+    result = run_command(model_command + [prompt])
+    if result.returncode != 0:
+        print(f"> **error** model command failed: {result.stderr.strip()}", file=sys.stderr)
+        return
+    output = re.sub(r" *\u2014 *", " ", result.stdout)
+    print(output)
+
+
+def main():
+    load_dotenv()
+    parser = argparse.ArgumentParser(
+        description="Generate developer feedback from Phabricator or git activity."
+    )
+    parser.add_argument("quarter_start", help='Quarter start date, e.g. "2026-01-01"')
+    parser.add_argument(
+        "--provider",
+        choices=("phabricator", "git"),
+        default=os.environ.get("DEVFEEDBACKAI_PROVIDER", "phabricator"),
+        help="Activity provider to read from.",
+    )
+    parser.add_argument(
+        "--users",
+        default=os.environ.get("DEVFEEDBACKAI_USERS", ""),
+        help="Comma-separated usernames, author names, or author emails.",
+    )
+    parser.add_argument(
+        "--teams",
+        default=os.environ.get("DEVFEEDBACKAI_TEAMS", ""),
+        help="Comma-separated team/project names. Supported by the Phabricator provider.",
+    )
+    parser.add_argument(
+        "--repo",
+        default=os.environ.get("DEVFEEDBACKAI_GIT_REPO", "."),
+        help="Git repo path for the git provider.",
+    )
+    args = parser.parse_args()
+
+    if args.provider == "phabricator" and not args.users and not args.teams:
+        parser.error("phabricator provider requires at least one of --users or --teams")
+
+    epoch_start, since_iso = parse_date(args.quarter_start)
+    print(f"> {APP_NAME}: provider={args.provider}, since={since_iso}", file=sys.stderr)
+
+    if args.provider == "phabricator":
+        datasets = collect_phabricator_activity(args, epoch_start)
+    else:
+        datasets = collect_git_activity(args, epoch_start, since_iso)
+
+    for dataset in datasets:
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"# {dataset['person']}", flush=True)
+        print(f"{'=' * 60}\n", flush=True)
+        generate_feedback(dataset, since_iso)
+
+
+if __name__ == "__main__":
+    main()
