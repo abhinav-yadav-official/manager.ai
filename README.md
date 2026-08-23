@@ -4,7 +4,7 @@
 
 **Generate quarterly developer feedback from Phabricator or git activity.**
 
-[![Release](https://img.shields.io/github/v/release/abhinav-yadav-official/DevFeedbackAI?style=for-the-badge)](https://github.com/abhinav-yadav-official/DevFeedbackAI/releases)
+[![Release](https://img.shields.io/github/v/release/almostturingcomplete/DevFeedbackAI?style=for-the-badge)](https://github.com/almostturingcomplete/DevFeedbackAI/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.x-3776AB?style=for-the-badge&logo=python&logoColor=white)]()
 
@@ -30,7 +30,7 @@ The output is markdown with `Delivery`, `Quality`, and `Behavior` sections.
 ## Installation
 
 ```sh
-git clone https://github.com/abhinav-yadav-official/DevFeedbackAI.git
+git clone https://github.com/almostturingcomplete/DevFeedbackAI.git
 cd DevFeedbackAI
 cp .env.example .env
 ```
